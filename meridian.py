@@ -73,6 +73,7 @@ class Meridian:
         
         images = []
         master_size = None
+
         for i, f in enumerate(batch_files):
             img = Image.open(f).convert("RGB")
             img = ImageOps.exif_transpose(img) 
@@ -92,8 +93,15 @@ class Meridian:
 
         state["current_index"] += stride
 
-        return (batch_tensor, reference_tensor)
+        state["current_index"] += stride
+        
+        if state["current_index"] >= self.total_frames:
+            return {
+                "ui": {"is_complete": [True]}, 
+                "result": (batch_tensor, reference_tensor)
+            }
 
+        return (batch_tensor, reference_tensor)
     @classmethod
     def IS_CHANGED(s, **kwargs):
         import random
