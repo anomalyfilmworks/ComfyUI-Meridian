@@ -23,5 +23,5 @@ track of frame indices and ensuring temporal consistency between batches is a ma
 ## 📈 Node Map (Connections)
 *   **batch_images**: Connect to **VAE Encode** or **KSampler**.
 *   **reference_frames**: Connect to **IPAdapter** or **ControlNet-Tile** for temporal coherence.
-*   **is_complete**: Connect to the **Stop/Pause** input of your **Video Combine** node.
+
 
