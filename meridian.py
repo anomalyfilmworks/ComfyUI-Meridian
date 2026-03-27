@@ -1,107 +1,91 @@
-# ==============================================================================
-# PROJECT: Meridian (Temporal Batch Loader)
-# WRITTEN BY: Andrew F Burd
-# LICENSE: MIT License
-# DESCRIPTION: A high-performance sequence manager for ComfyUI.
-# ==============================================================================
-
-import os
-import torch
-import re
-import folder_paths
-import numpy as np
+import os, re, math, torch, numpy as np, folder_paths
 from PIL import Image, ImageOps
+from server import PromptServer
+
+# THE GLOBAL VAULT: Keeps your place in the folder across the queue
+if "GLOBAL_MERIDIAN_VAULT" not in globals():
+    GLOBAL_MERIDIAN_VAULT = {}
 
 class Meridian:
-    def __init__(self):
-        self.node_states = {}
-
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "directory": ("STRING", {"default": "", "path": "True"}), 
-                "batch_size": ("INT", {"default": 30, "min": 1, "max": 10000}),
-                "overlap_frames": ("INT", {"default": 4, "min": 0, "max": 64}),
-                "start_at_batch": ("INT", {"default": 0, "min": 0, "max": 10000}),
-                "sort_mode": (["numerical", "alphabetical", "modified_date"], {"default": "numerical"}),
+                "directory": ("STRING", {"default": "", "path": "True"}),
+                "batch_size": ("INT", {"default": 30, "min": 1}),
+                "overlap_frames": ("INT", {"default": 4, "min": 0}),
+                "sort_mode": (["numerical", "alphabetical"],),
                 "reset": ("BOOLEAN", {"default": False}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE") 
-    RETURN_NAMES = ("batch_images", "reference_frames")
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("images", "references")
     FUNCTION = "load_batch"
     CATEGORY = "Custom_Animation"
+    OUTPUT_NODE = True
 
-    def load_batch(self, directory, batch_size, overlap_frames, start_at_batch, sort_mode, reset, unique_id):
-        directory = directory.strip().strip('"').strip("'")
-        if not os.path.isabs(directory):
-            directory = os.path.join(folder_paths.get_input_directory(), directory)
-        path = os.path.abspath(os.path.expanduser(directory.replace("\\", "/")))
-        
-        stride = max(1, batch_size - overlap_frames)
-        
-        if unique_id not in self.node_states or reset:
-            self.node_states[unique_id] = {"current_index": start_at_batch * stride, "image_paths": []}
-        
-        state = self.node_states[unique_id]
+    def load_batch(self, directory, batch_size, overlap_frames, sort_mode, reset, unique_id=None):
+        path = os.path.abspath(os.path.expanduser(directory.strip().strip('"').strip("'").replace("\\", "/")))
+        if not os.path.isabs(path): path = os.path.join(folder_paths.get_input_directory(), path)
 
-        if not state["image_paths"] or reset:
-            if not os.path.exists(path):
-                return (torch.zeros(1, 64, 64, 3), torch.zeros(1, 64, 64, 3))
-            
-            valid_exts = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff')
-            files = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(valid_exts)]
-            
+        # 1. PERSISTENCE: Check if we are starting a new folder or resuming
+        if unique_id not in GLOBAL_MERIDIAN_VAULT:
+            GLOBAL_MERIDIAN_VAULT[unique_id] = {"idx": 0, "paths": [], "last_path": path, "memory": None}
+        
+        state = GLOBAL_MERIDIAN_VAULT[unique_id]
+
+        # 2. AUTO-RESET: Only if you change folders or hit the reset button
+        if state["last_path"] != path or reset:
+            state.update({"idx": 0, "paths": [], "last_path": path, "memory": None})
+            print(f"[Meridian] Initializing: {path}")
+
+        # 3. FOLDER SCAN & NATURAL SORT
+        if not state["paths"]:
+            if not os.path.exists(path): return self._empty()
+            files = [f for f in os.listdir(path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'))]
             if sort_mode == "numerical":
-                def natural_keys(text):
-                    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(text)) if c]
-                state["image_paths"] = sorted(files, key=natural_keys)
-            else:
-                state["image_paths"] = sorted(files)
+                files.sort(key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s) if t])
+            else: files.sort()
+            state["paths"] = [os.path.join(path, f) for f in files]
 
-        total_frames = len(state["image_paths"])
-        start_idx = state["current_index"]
+        total = len(state["paths"])
+        start = state["idx"]
+        total_batches = math.ceil(total / batch_size)
+
+        # 4. COMPLETION CHECK
+        if start >= total:
+            PromptServer.instance.send_sync("meridian.status", {"node_id": unique_id, "status": "Complete", "total_batches": total_batches})
+            state["idx"] = 0
+            return self._empty()
+
+        # 5. THE CLEAN JUMP
+        end = min(start + batch_size, total)
+        batch_files = state["paths"][start:end]
         
-        if start_idx >= total_frames:
-            return (torch.zeros(1, 64, 64, 3), torch.zeros(1, 64, 64, 3))
+        # 6. DASHBOARD HANDSHAKE
+        PromptServer.instance.send_sync("meridian.status", {
+            "node_id": unique_id, "status": "Running", "frame_start": start + 1, "frame_end": end, 
+            "current_batch": (start // batch_size) + 1, "total_batches": total_batches
+        })
 
-        end_idx = min(start_idx + batch_size, total_frames)
-        batch_files = state["image_paths"][start_idx:end_idx]
-        
-        images = []
-        master_size = None
+        # 7. LOAD IMAGES
+        imgs = [torch.from_numpy(np.array(ImageOps.exif_transpose(Image.open(f).convert("RGB"))).astype(np.float32) / 255.0)[None,] for f in batch_files]
+        batch_tensor = torch.cat(imgs, dim=0)
 
-        for i, f in enumerate(batch_files):
-            img = Image.open(f).convert("RGB")
-            img = ImageOps.exif_transpose(img) 
-            
-            if master_size is None:
-                master_size = img.size
-            
-            if img.size != master_size:
-                img = img.resize(master_size, Image.Resampling.LANCZOS)
-                
-            img_np = np.array(img).astype(np.float32) / 255.0
-            images.append(torch.from_numpy(img_np)[None,])
-            
-        batch_tensor = torch.cat(images, dim=0)
-        ref_count = min(overlap_frames, len(images))
-        reference_tensor = batch_tensor[-ref_count:] if ref_count > 0 else torch.zeros(1, 64, 64, 3)
+        # 8. THE STYLE BRIDGE (Memory from previous batch)
+        ref_out = state["memory"] if state["memory"] is not None else torch.zeros(1, 64, 64, 3)
+        state["memory"] = batch_tensor[-min(overlap_frames, len(imgs)):] if overlap_frames > 0 else None
 
-        state["current_index"] += stride
+        # 9. ADVANCE THE COUNTER
+        state["idx"] = start + batch_size
+        return (batch_tensor, ref_out)
 
-        state["current_index"] += stride
-        
-        if state["current_index"] >= self.total_frames:
-            return {
-                "ui": {"is_complete": [True]}, 
-                "result": (batch_tensor, reference_tensor)
-            }
+    def _empty(self):
+        z = torch.zeros(1, 64, 64, 3)
+        return (z, z.clone())
 
-        return (batch_tensor, reference_tensor)
     @classmethod
     def IS_CHANGED(s, **kwargs):
         import random
